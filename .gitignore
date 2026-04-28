@@ -1,0 +1,25 @@
+# editor
+.vscode/
+.idea/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# datasets and models
+models/
+train_datasets_leela/
+train_datasets_lichess_elite/
+train_lichess_elite/
+train_shards/
+
+*.npz
+*.bin
+*.pgn
+*.pt
+*.pth
+*.nnue
+*.log
+*.exe

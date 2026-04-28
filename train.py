@@ -1,0 +1,595 @@
+import os
+import time
+import random
+from dataclasses import dataclass, asdict
+from typing import List, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.multiprocessing as mp
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import StepLR
+
+from nnue import NNUE, NNUELoss, clamp_weights
+from dataset_io import load_training_shard
+from data_handling import make_sparse_batch_from_preprocessed
+
+
+Batch = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+@dataclass
+class TrainConfig:
+    max_features: int = 22528
+    bucket_nb: int = 8
+
+    model_dir: str = "models"
+    model_name: str = "nnue_model_bucket_v8"
+    load_existing: bool = True
+
+    save_checkpoints: bool = True
+    checkpoint_every_validations: int = 1
+    keep_optimizer_state: bool = True
+
+    num_workers: int = 1
+    prefetch_shards: int = 2
+
+    lr: float = 0.0005
+    lr_gamma: float = 0.98
+    batch_size: int = 32768
+    scaling_factor: float = 410.0
+    exponent: float = 2.5
+
+    validate_every_shards: int = 10
+    train_shard_count: int = 564
+
+
+def get_model_paths(cfg: TrainConfig) -> dict:
+    os.makedirs(cfg.model_dir, exist_ok=True)
+
+    base = os.path.join(cfg.model_dir, cfg.model_name)
+
+    return {
+        "latest": base + "_latest.pt",
+        "best": base + "_best.pt",
+        "final": base + "_final.pt",
+    }
+
+
+def save_training_state(
+    path: str,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.StepLR,
+    epoch: int,
+    completed_shards: int,
+    best_val_loss: float,
+    cfg: TrainConfig,
+):
+    state = {
+        "model_state_dict": model.state_dict(),
+        "epoch": epoch,
+        "completed_shards": completed_shards,
+        "best_val_loss": best_val_loss,
+        "config": asdict(cfg),
+    }
+
+    if cfg.keep_optimizer_state:
+        state["optimizer_state_dict"] = optimizer.state_dict()
+        state["scheduler_state_dict"] = scheduler.state_dict()
+
+    torch.save(state, path)
+
+
+def load_model_or_checkpoint(
+    path: str,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer | None = None,
+    scheduler: torch.optim.lr_scheduler.StepLR | None = None,
+    device: torch.device = torch.device("cpu"),
+) -> dict:
+    state = torch.load(path, map_location=device)
+
+    # Supports both old raw state_dict files and new checkpoint dicts.
+    if isinstance(state, dict) and "model_state_dict" in state:
+        model.load_state_dict(state["model_state_dict"])
+
+        if optimizer is not None and "optimizer_state_dict" in state:
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+
+        if scheduler is not None and "scheduler_state_dict" in state:
+            scheduler.load_state_dict(state["scheduler_state_dict"])
+
+        return state
+
+    model.load_state_dict(state)
+    return {
+        "epoch": 0,
+        "completed_shards": 0,
+        "best_val_loss": float("inf"),
+    }
+
+
+def init_weights(layer: torch.nn.Module):
+    if isinstance(layer, torch.nn.Linear):
+        torch.nn.init.uniform_(layer.weight, a=-0.1, b=0.1)
+        if layer.bias is not None:
+            torch.nn.init.zeros_(layer.bias)
+
+
+def cuda_sync(device: torch.device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def maybe_pin_batch(batch: Batch) -> Batch:
+    return tuple(
+        x.pin_memory() if torch.is_tensor(x) and x.device.type == "cpu" else x
+        for x in batch
+    )  # type: ignore[return-value]
+
+
+def move_batch_to_device(batch: Batch, device: torch.device) -> Batch:
+    return tuple(
+        x.to(device, non_blocking=True) if torch.is_tensor(x) else x
+        for x in batch
+    )  # type: ignore[return-value]
+
+
+def build_shard_batches_cpu(
+    shard: dict,
+    batch_size: int,
+    max_features: int,
+    pin_memory: bool,
+) -> List[Batch]:
+    num_positions = len(shard["stm"])
+    order = np.arange(num_positions)
+    np.random.shuffle(order)
+
+    batches: List[Batch] = []
+    for start in range(0, num_positions, batch_size):
+        rows = order[start:start + batch_size]
+        batch = make_sparse_batch_from_preprocessed(
+            shard,
+            rows,
+            max_features=max_features,
+            device=torch.device("cpu"),
+        )
+        if pin_memory:
+            batch = maybe_pin_batch(batch)
+        batches.append(batch)
+
+    return batches
+
+
+def shard_worker(
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
+    batch_size: int,
+    max_features: int,
+    pin_memory: bool,
+):
+    while True:
+        shard_path = task_queue.get()
+        if shard_path is None:
+            return
+
+        try:
+            shard = load_training_shard(shard_path)
+            batches = build_shard_batches_cpu(
+                shard=shard,
+                batch_size=batch_size,
+                max_features=max_features,
+                pin_memory=pin_memory,
+            )
+            result_queue.put(("ok", shard_path, batches))
+        except Exception as exc:
+            result_queue.put(("error", shard_path, repr(exc)))
+
+
+def load_validation_batches(
+    val_shard_paths: Sequence[str],
+    batch_size: int,
+    max_features: int,
+    pin_memory: bool,
+) -> List[Batch]:
+    print("loading validation shard(s)...")
+
+    val_batches: List[Batch] = []
+    for path in val_shard_paths:
+        shard = load_training_shard(path)
+        val_batches.extend(
+            build_shard_batches_cpu(
+                shard=shard,
+                batch_size=batch_size,
+                max_features=max_features,
+                pin_memory=pin_memory,
+            )
+        )
+
+    print(f"cached {len(val_batches)} validation batches in RAM")
+    return val_batches
+
+
+@torch.no_grad()
+def evaluate_validation(
+    model: torch.nn.Module,
+    val_batches: Sequence[Batch],
+    loss_fn: NNUELoss,
+    device: torch.device,
+    bucket_nb: int,
+) -> dict:
+    model.eval()
+
+    total_loss_sum = 0.0
+    total_samples = 0
+
+    bucket_loss_sum = np.zeros(bucket_nb, dtype=np.float64)
+    bucket_count = np.zeros(bucket_nb, dtype=np.int64)
+
+    start = time.perf_counter()
+
+    for batch_cpu in val_batches:
+        white_features_t, black_features_t, stm_t, score_t, bucket_t = move_batch_to_device(batch_cpu, device)
+
+        output = model(white_features_t, black_features_t, stm_t, bucket_t)
+        per_sample = loss_fn.per_sample(output, score_t).view(-1)
+        buckets = bucket_t.view(-1)
+
+        total_loss_sum += per_sample.sum().item()
+        total_samples += per_sample.numel()
+
+        bucket_count_batch = torch.bincount(buckets, minlength=bucket_nb)
+        bucket_loss_batch = torch.zeros(bucket_nb, device=device)
+        bucket_loss_batch.scatter_add_(0, buckets, per_sample)
+
+        bucket_count += bucket_count_batch.cpu().numpy()
+        bucket_loss_sum += bucket_loss_batch.cpu().numpy()
+
+    cuda_sync(device)
+
+    elapsed = time.perf_counter() - start
+    val_loss = total_loss_sum / max(total_samples, 1)
+    bucket_loss = bucket_loss_sum / np.maximum(bucket_count, 1)
+
+    return {
+        "val_loss": val_loss,
+        "bucket_loss": bucket_loss,
+        "bucket_count": bucket_count,
+        "elapsed": elapsed,
+        "positions_per_sec": total_samples / max(elapsed, 1e-9),
+    }
+
+
+def start_workers(
+    num_workers: int,
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
+    batch_size: int,
+    max_features: int,
+    pin_memory: bool,
+) -> List[mp.Process]:
+    workers: List[mp.Process] = []
+
+    for _ in range(num_workers):
+        process = mp.Process(
+            target=shard_worker,
+            args=(task_queue, result_queue, batch_size, max_features, pin_memory),
+            daemon=True,
+        )
+        process.start()
+        workers.append(process)
+
+    return workers
+
+
+def stop_workers(workers: Sequence[mp.Process], task_queue: mp.Queue) -> None:
+    for _ in workers:
+        task_queue.put(None)
+
+    for process in workers:
+        process.join(timeout=2)
+
+
+def fill_task_queue(
+    task_queue: mp.Queue,
+    shard_paths: Sequence[str],
+    next_submit_idx: int,
+    inflight: int,
+    max_inflight: int,
+) -> Tuple[int, int]:
+    while next_submit_idx < len(shard_paths) and inflight < max_inflight:
+        task_queue.put(shard_paths[next_submit_idx])
+        next_submit_idx += 1
+        inflight += 1
+    return next_submit_idx, inflight
+
+
+def train_one_shard(
+    model: torch.nn.Module,
+    optimizer: AdamW,
+    loss_fn: NNUELoss,
+    shard_batches: Sequence[Batch],
+    device: torch.device,
+) -> dict:
+    model.train()
+
+    total_loss = 0.0
+    batch_count = 0
+    shard_positions = 0
+
+    start = time.perf_counter()
+
+    for batch_cpu in shard_batches:
+        white_features_t, black_features_t, stm_t, score_t, bucket_t = move_batch_to_device(batch_cpu, device)
+
+        output = model(white_features_t, black_features_t, stm_t, bucket_t)
+        loss = loss_fn(output, score_t)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        clamp_weights(model)
+
+        batch_pos = score_t.numel()
+        total_loss += loss.item()
+        batch_count += 1
+        shard_positions += batch_pos
+
+    cuda_sync(device)
+
+    elapsed = time.perf_counter() - start
+
+    return {
+        "loss_sum": total_loss,
+        "loss_avg": total_loss / max(batch_count, 1),
+        "batch_count": batch_count,
+        "positions": shard_positions,
+        "elapsed": elapsed,
+        "pos_per_sec": shard_positions / max(elapsed, 1e-9),
+        "batches_per_sec": batch_count / max(elapsed, 1e-9),
+    }
+
+
+def print_bucket_metrics(val_metrics: dict, bucket_nb: int):
+    parts = []
+    for b in range(bucket_nb):
+        parts.append(
+            f"b{b}:{val_metrics['bucket_loss'][b]:.6f}({val_metrics['bucket_count'][b]})"
+        )
+    print("[validation buckets] " + " ".join(parts))
+
+
+def main():
+    mp.set_start_method("spawn", force=True)
+
+    cfg = TrainConfig()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pin_memory = device.type == "cuda"
+
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+
+    model_paths = get_model_paths(cfg)
+
+    model = NNUE(bucket_nb=cfg.bucket_nb).to(device)
+
+    optimizer = AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.999), eps=1e-7, weight_decay=0)
+
+    scheduler = StepLR(optimizer, step_size=1, gamma=cfg.lr_gamma)
+
+    best_val_loss = float("inf")
+
+    if cfg.load_existing and os.path.exists(model_paths["best"]):
+        state = load_model_or_checkpoint(
+            path=model_paths["best"],
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+        )
+        best_val_loss = state.get("best_val_loss", float("inf"))
+        clamp_weights(model)
+        print(f"loaded existing checkpoint from {model_paths['best']}")
+        print(f"best_val_loss={best_val_loss:.6f}")
+    else:
+        model.apply(init_weights)
+        clamp_weights(model)
+        print("initialized new model")
+
+
+    loss_fn = NNUELoss(
+        scaling_factor=cfg.scaling_factor,
+        exponent=cfg.exponent,
+    )
+
+    all_shard_paths = [
+        f"train_shards/shard{i}.npz"
+        for i in range(cfg.train_shard_count)
+    ]
+    val_shard_paths = all_shard_paths[-2:]
+    train_shard_paths = all_shard_paths[:-2]
+
+    val_batches = load_validation_batches(
+        val_shard_paths=val_shard_paths,
+        batch_size=cfg.batch_size,
+        max_features=cfg.max_features,
+        pin_memory=pin_memory,
+    )
+
+    task_queue = mp.Queue(maxsize=cfg.num_workers + cfg.prefetch_shards)
+    result_queue = mp.Queue(maxsize=cfg.num_workers + cfg.prefetch_shards)
+
+    workers = start_workers(
+        num_workers=cfg.num_workers,
+        task_queue=task_queue,
+        result_queue=result_queue,
+        batch_size=cfg.batch_size,
+        max_features=cfg.max_features,
+        pin_memory=pin_memory,
+    )
+
+    epoch = 0
+    validation_count = 0
+
+    try:
+        while True:
+            epoch += 1
+            random.shuffle(train_shard_paths)
+            print(f"starting epoch {epoch}")
+
+            running_train_loss_sum = 0.0
+            running_train_batches = 0
+            running_train_positions = 0
+            segment_start_time = time.perf_counter()
+
+            next_submit_idx = 0
+            completed_shards = 0
+            inflight = 0
+            max_inflight = cfg.num_workers + cfg.prefetch_shards
+
+            next_submit_idx, inflight = fill_task_queue(
+                task_queue=task_queue,
+                shard_paths=train_shard_paths,
+                next_submit_idx=next_submit_idx,
+                inflight=inflight,
+                max_inflight=max_inflight,
+            )
+
+            while completed_shards < len(train_shard_paths):
+                status, shard_path, payload = result_queue.get()
+                inflight -= 1
+
+                if status == "error":
+                    raise RuntimeError(f"worker failed on {shard_path}: {payload}")
+
+                shard_metrics = train_one_shard(
+                    model=model,
+                    optimizer=optimizer,
+                    loss_fn=loss_fn,
+                    shard_batches=payload,
+                    device=device,
+                )
+
+                running_train_loss_sum += shard_metrics["loss_sum"]
+                running_train_batches += shard_metrics["batch_count"]
+                running_train_positions += shard_metrics["positions"]
+                completed_shards += 1
+
+                print(
+                    f"{os.path.basename(shard_path)} "
+                    f"train_loss: {shard_metrics['loss_avg']:.6f} "
+                    f"train_pos_per_sec: {shard_metrics['pos_per_sec']:.0f} "
+                    f"train_batches_per_sec: {shard_metrics['batches_per_sec']:.2f}"
+                )
+
+                next_submit_idx, inflight = fill_task_queue(
+                    task_queue=task_queue,
+                    shard_paths=train_shard_paths,
+                    next_submit_idx=next_submit_idx,
+                    inflight=inflight,
+                    max_inflight=max_inflight,
+                )
+
+                if completed_shards % cfg.validate_every_shards == 0:
+                    cuda_sync(device)
+
+                    train_elapsed = time.perf_counter() - segment_start_time
+                    train_loss_avg = running_train_loss_sum / max(running_train_batches, 1)
+                    train_pos_per_sec = running_train_positions / max(train_elapsed, 1e-9)
+                    train_batches_per_sec = running_train_batches / max(train_elapsed, 1e-9)
+
+                    val_metrics = evaluate_validation(
+                        model=model,
+                        val_batches=val_batches,
+                        loss_fn=loss_fn,
+                        device=device,
+                        bucket_nb=cfg.bucket_nb,
+                    )
+
+                    gap = val_metrics["val_loss"] - train_loss_avg
+
+                    print(
+                        f"[validation] epoch={epoch} shard={completed_shards} "
+                        f"train_loss={train_loss_avg:.6f} "
+                        f"val_loss={val_metrics['val_loss']:.6f} "
+                        f"gap={gap:.6f} "
+                        f"train_pos_per_sec={train_pos_per_sec:.0f} "
+                        f"train_batches_per_sec={train_batches_per_sec:.2f} "
+                        f"val_pos_per_sec={val_metrics['positions_per_sec']:.0f}"
+                    )
+                    print_bucket_metrics(val_metrics, cfg.bucket_nb)
+
+                    validation_count += 1
+
+                    save_training_state(
+                        path=model_paths["latest"],
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch,
+                        completed_shards=completed_shards,
+                        best_val_loss=best_val_loss,
+                        cfg=cfg
+                    )
+                    print(f"[save] latest saved to {model_paths['latest']}")
+
+                    if val_metrics["val_loss"] < best_val_loss:
+                        best_val_loss = val_metrics["val_loss"]
+
+                        save_training_state(
+                            path=model_paths["best"],
+                            model=model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            epoch=epoch,
+                            completed_shards=completed_shards,
+                            best_val_loss=best_val_loss,
+                            cfg=cfg
+                        )
+
+                        print(f"[save] new best saved to {model_paths['best']} val_loss={best_val_loss:.6f}")
+
+
+                    running_train_loss_sum = 0.0
+                    running_train_batches = 0
+                    running_train_positions = 0
+                    segment_start_time = time.perf_counter()
+
+            print("saving model")
+            save_training_state(
+                path=model_paths["latest"],
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                completed_shards=len(train_shard_paths),
+                best_val_loss=best_val_loss,
+                cfg=cfg,
+            )
+            print("saving completed")
+
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"learning_rate={current_lr:.8g}")
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user, saving model...")
+
+    finally:
+        stop_workers(workers, task_queue)
+        save_training_state(
+            path=model_paths["final"],
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=epoch,
+            completed_shards=completed_shards if "completed_shards" in locals() else 0,
+            best_val_loss=best_val_loss,
+            cfg=cfg,
+        )
+        print(f"final save completed: {model_paths['final']}")
+
+
+if __name__ == "__main__":
+    main()
