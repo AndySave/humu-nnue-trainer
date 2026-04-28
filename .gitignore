@@ -10,6 +10,7 @@ __pycache__/
 
 # datasets and models
 models/
+train/
 train_datasets_leela/
 train_datasets_lichess_elite/
 train_lichess_elite/
