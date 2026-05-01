@@ -7,7 +7,7 @@ import numpy as np
 from pathlib import Path
 from multiprocessing import Pool
 
-from nnue_constants import PIECE_TYPE_OFFSETS_WHITE, PIECE_TYPE_OFFSETS_BLACK, PADDING_IDX, MAX_PIECES
+from nnue_constants import PIECE_TYPE_OFFSETS_WHITE, PIECE_TYPE_OFFSETS_BLACK, PADDING_IDX, MAX_PIECES, BUCKET_NB
 from utils import encoded_move_is_promotion, encode_move
 
 
@@ -106,7 +106,61 @@ def load_training_shard(path):
         }
 
 
-def convert_shard_to_training_format(old_file, out_file, buckets_nb=8, ply_threshold=20):
+def board_to_training_format(board: chess.Board, buckets_nb: int = BUCKET_NB):
+    bucket_size = MAX_PIECES // buckets_nb
+
+    white_idx = [PADDING_IDX] * MAX_PIECES
+    black_idx = [PADDING_IDX] * MAX_PIECES
+
+    piece_data = []
+    white_king_sq = None
+    black_king_sq = None
+    for position, piece in board.piece_map().items():
+        piece_data.append((hash(piece), position))
+
+        if piece.piece_type == chess.KING:
+            if piece.color == chess.WHITE:
+                white_king_sq = position
+            else:
+                black_king_sq = position
+    
+    if white_king_sq is None or black_king_sq is None:
+        raise RuntimeError("Illegal board is missing king:", str(board))
+    
+    # Fill active indices for white
+    orient_mask = 0
+    king_sq_o = white_king_sq ^ orient_mask
+    mirror_mask = 7 if (king_sq_o & 4) else 0
+    king_sq_t = king_sq_o ^ mirror_mask
+
+    king_rank = king_sq_t >> 3
+    king_sq_half = king_sq_t - (king_rank * 4)
+        
+    for i, (piece_type, position) in enumerate(piece_data):
+        sq_t = position ^ orient_mask ^ mirror_mask
+        white_idx[i] = king_sq_half * 704 + PIECE_TYPE_OFFSETS_WHITE[piece_type] + sq_t
+    
+    # Fill active indices for black
+    orient_mask = 63
+    king_sq_o = black_king_sq ^ orient_mask
+    mirror_mask = 7 if (king_sq_o & 4) else 0
+    king_sq_t = king_sq_o ^ mirror_mask
+
+    king_rank = king_sq_t >> 3
+    king_sq_half = king_sq_t - (king_rank * 4)
+
+    for i, (piece_type, position) in enumerate(piece_data):
+        sq_t = position ^ orient_mask ^ mirror_mask
+        black_idx[i] = king_sq_half * 704 + PIECE_TYPE_OFFSETS_BLACK[piece_type] + sq_t
+
+    count = len(piece_data)
+    stm = 0 if board.turn == chess.WHITE else 1
+    bucket = (len(piece_data) - 1) // bucket_size
+
+    return white_idx, black_idx, count, stm, bucket
+
+
+def convert_shard_to_training_format(old_file, out_file, buckets_nb=BUCKET_NB, ply_threshold=20):
     record_size = 36
     num_records = count_records(old_file, record_size)
     bucket_size = MAX_PIECES // buckets_nb
